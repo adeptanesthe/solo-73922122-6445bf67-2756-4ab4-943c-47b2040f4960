@@ -182,3 +182,76 @@ def test_pack_roundtrip_preserves_arrays():
         np.testing.assert_array_equal(restored[k], pack[k])
     with pytest.raises(pack_mod.PackError):
         pack_mod.decode_pack("not-base64!!!")
+
+
+def readme_corner_pack():
+    # 与 README / examples/corner_demo.py 相同的 2 入 3 出模型（通道 1 的 a=0）
+    return pack_mod.build_pack(
+        a=[1.5, 0.0], b=[-2.0, 0.75],
+        kernel=[
+            [[[0, 0, 0], [0, 1, 0], [0, 0, 0]],
+             [[0, 0, 0], [0, 0, 0], [0, 0, 0]]],
+            [[[0.25, 0, -0.5], [0, 1, 0], [0.5, 0, -0.25]],
+             [[0, 0, 0], [0, 0, 0], [0, 0, 0]]],
+            [[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+             [[-1.25, 0, 0], [0, 0, 0], [0, 0, 0]]],
+        ],
+        bias=[0.5, -1.0, 2.0],
+    )
+
+
+def test_huge_scan_bottom_right_single_response():
+    # 12000x12000 扫描图右下角 1x1：旧实现会分配 1.15 GiB 的 HxW 索引表
+    pack = readme_corner_pack()
+    H = W = 12000
+    win = (H - 1, W - 1, H, W)
+    info = engine.required_coordinates(pack, H, W, *win)
+    assert info["coords"] == [(H - 2, W - 2), (H - 1, W - 1)]
+    pixels = {
+        (H - 2, W - 2): [2.0, -2.0],
+        (H - 1, W - 1): [3.0, -4.0],
+        (12, 34): [9.0, 9.0],  # 远在窗口外的合法图内额外像素
+    }
+    out = engine.evaluate_window(pack, H, W, *win, pixels)
+    assert out.shape == (1, 1, 3)
+    np.testing.assert_allclose(
+        out, np.array([[[3.0, 1.75, 1.0625]]]), atol=1e-12, rtol=0
+    )
+
+
+def test_evaluate_allocates_no_full_image_map(monkeypatch):
+    # 内存复杂度守卫：求值期间 np.full 的尺寸不得超过窗口源点包围盒 3x3
+    import app.engine as eng
+
+    real_full = np.full
+    full_sizes = []
+
+    def spy_full(shape, fill_value, dtype=None, **kwargs):
+        full_sizes.append(int(np.prod(shape)))
+        return real_full(shape, fill_value, dtype=dtype, **kwargs)
+
+    monkeypatch.setattr(eng.np, "full", spy_full)
+    pack = readme_corner_pack()
+    H = W = 12000
+    pixels = {(H - 2, W - 2): [2.0, -2.0], (H - 1, W - 1): [3.0, -4.0]}
+    engine.evaluate_window(pack, H, W, H - 1, W - 1, H, W, pixels)
+    assert full_sizes, "应当使用窗口局部索引图"
+    assert max(full_sizes) <= 9
+    assert all(n < H * W for n in full_sizes)
+
+
+def test_empty_pixels_huge_image_zero_kernel():
+    # 空必读清单 + pixels={} 在超大图上也能即时求值（偏置常量）
+    pack = pack_mod.build_pack(
+        a=[2.0], b=[1.0], kernel=np.zeros((1, 1, 3, 3)).tolist(), bias=[0.25]
+    )
+    out = engine.evaluate_window(
+        pack, 12000, 12000, 11999, 11999, 12000, 12000, pixels={}
+    )
+    np.testing.assert_allclose(out, np.full((1, 1, 1), 0.25))
+
+
+def test_empty_pixels_rejected_only_when_required_nonempty():
+    pack = readme_corner_pack()
+    with pytest.raises(engine.EngineError, match="缺少必读像素"):
+        engine.evaluate_window(pack, 12000, 12000, 11999, 11999, 12000, 12000, {})

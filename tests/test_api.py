@@ -130,3 +130,60 @@ def test_pack_size_independent_of_image_size():
     import base64
     raw_len = len(base64.b64decode(token))
     assert raw_len < 4096
+
+
+def test_empty_pixels_accepted_for_empty_required_list():
+    # 全零卷积：必读清单为空，pixels={} 必须通过 schema 并求出 bias
+    zero_kernel = np.zeros((1, 1, 3, 3)).tolist()
+    r = client.post("/convert", json={
+        "a": [1.0], "b": [0.5], "kernel": zero_kernel, "bias": [0.25]})
+    assert r.status_code == 200, r.text
+    tok = r.json()["pack"]
+    r = client.post("/required-coordinates", json={
+        "pack": tok, "H": 5, "W": 5,
+        "window": {"r0": 0, "c0": 0, "r1": 5, "c1": 5}})
+    assert r.status_code == 200 and r.json()["coords"] == []
+    r = client.post("/evaluate", json={
+        "pack": tok, "H": 5, "W": 5,
+        "window": {"r0": 0, "c0": 0, "r1": 5, "c1": 5},
+        "pixels": {}})
+    assert r.status_code == 200, r.text
+    out = np.array(r.json()["output"])
+    assert out.shape == (5, 5, 1)
+    np.testing.assert_allclose(out, 0.25)
+
+
+def test_empty_pixels_with_required_coords_still_422(converted):
+    r = client.post("/evaluate", json={
+        "pack_id": converted["pack_id"], "H": 4, "W": 3,
+        "window": {"r0": 3, "c0": 2, "r1": 4, "c1": 3},
+        "pixels": {}})
+    assert r.status_code == 422
+    assert "缺少必读像素" in r.json()["detail"]
+
+
+def test_huge_scan_bottom_right_api(converted):
+    # 12000x12000 扫描图右下角单点：请求体只含 2 个必读像素 + 1 个远处额外像素
+    H = W = 12000
+    win = {"r0": H - 1, "c0": W - 1, "r1": H, "c1": W}
+    r = client.post("/required-coordinates", json={
+        "pack": converted["pack"], "H": H, "W": W, "window": win})
+    assert r.status_code == 200, r.text
+    assert r.json()["count"] == 2
+    pixels = {
+        f"{H - 2},{W - 2}": [2.0, -2.0],
+        f"{H - 1},{W - 1}": [3.0, -4.0],
+        "12,34": [9.0, 9.0],  # 远在窗口外的合法额外像素
+    }
+    r = client.post("/evaluate", json={
+        "pack": converted["pack"], "H": H, "W": W,
+        "window": win, "pixels": pixels})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["shape"] == [1, 1, 3]
+    np.testing.assert_allclose(
+        np.array(body["output"]),
+        np.array([[[3.0, 1.75, 1.0625]]]),
+        atol=1e-12, rtol=0,
+    )
+    assert body["pixels_used"] == 3

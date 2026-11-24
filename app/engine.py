@@ -149,6 +149,12 @@ def evaluate_window(
 
     pixels: {(r, c): [x_c0, x_c1, ...]}，只需提供 required_coordinates
     返回的坐标；缺少任一必读坐标（含非活跃通道无需提供）即抛 EngineError。
+
+    内存复杂度：临时数组只随**窗口面积** ``(ph+2)*(pw+2)``（tap 源点的
+    局部包围盒，ph=r1-r0, pw=c1-c0）与**实收像素数** P 增长，通道数为
+    1..4 的常数；绝不分配 H*W 的整图索引表，因此 12000x12000 图上求
+    单个右下角响应也只占用 KB 级临时内存。远在窗口外的合法（图内）
+    额外像素照常接收，仅不进入局部索引图。
     """
     r0, c0, r1, c1 = check_window(r0, c0, r1, c1, H, W)
     A = np.asarray(pack["A"], dtype=np.float64)        # (O,C,3,3)
@@ -159,8 +165,9 @@ def evaluate_window(
     req = required_coordinates(pack, H, W, r0, c0, r1, c1)
     req_set = {tuple(rc) for rc in req["coords"]}
 
-    # 解析像素 -> 向量化查表，缺失即报错
-    if not pixels:
+    # -- 解析实收像素 -> 排序数组（O(P) 内存），缺失/非法即报错 -------------
+    n_px = len(pixels)
+    if n_px == 0:
         if req_set:
             raise EngineError(
                 f"缺少必读像素坐标，例如 {sorted(req_set)[:5]}，共 {len(req_set)} 个"
@@ -168,19 +175,27 @@ def evaluate_window(
         keys = np.zeros((0, 2), dtype=np.int64)
         svals = np.zeros((0, C), dtype=np.float64)
     else:
-        keys = np.array([tuple(k) for k in pixels.keys()], dtype=np.int64)
-        if keys.ndim != 2 or keys.shape[1] != 2:
+        try:
+            keys = np.asarray([tuple(k) for k in pixels.keys()], dtype=np.int64)
+        except (TypeError, ValueError) as exc:
+            raise EngineError("pixels 的键必须是 [r, c] 二元组") from exc
+        if keys.ndim != 2 or keys.shape != (n_px, 2):
             raise EngineError("pixels 的键必须是 [r, c] 二元组")
-        svals = np.array([v for v in pixels.values()], dtype=np.float64)
-        if svals.shape != (keys.shape[0], C):
+        svals = np.asarray(list(pixels.values()), dtype=np.float64)
+        if svals.shape != (n_px, C):
             raise EngineError(f"每个像素点需要 {C} 个通道值，收到形状 {svals.shape}")
         if np.any(np.abs(svals) > 16.0):
             raise EngineError("像素值绝对值超过 16")
 
-        order = np.lexsort((keys[:, 1], keys[:, 0]))
-        skeys, svals = keys[order], svals[order]
+    order = np.lexsort((keys[:, 1], keys[:, 0])) if n_px else np.empty(0, dtype=np.int64)
+    skeys = keys[order]
+    svals = svals[order]
+    # 行优先线性编号；按 (row, col) 排序后必然单调递增
+    slinear = skeys[:, 0] * W + skeys[:, 1] if n_px else np.empty(0, dtype=np.int64)
+
+    if n_px:
         # 排序后逐行与上一行比较（np.diff 对多行整数数组会逐元素比较，不能直接用）
-        if len(skeys) > 1 and np.any(np.all(skeys[1:] == skeys[:-1], axis=1)):
+        if np.any(np.all(skeys[1:] == skeys[:-1], axis=1)):
             raise EngineError("pixels 中存在重复坐标")
         if np.any((skeys[:, 0] < 0) | (skeys[:, 0] >= H) |
                   (skeys[:, 1] < 0) | (skeys[:, 1] >= W)):
@@ -188,11 +203,8 @@ def evaluate_window(
 
     req_arr = np.array(sorted(req_set), dtype=np.int64)
     if len(req_arr):
-        pos = np.searchsorted(
-            (skeys[:, 0] * W + skeys[:, 1]) if len(skeys) else np.array([], dtype=np.int64),
-            req_arr[:, 0] * W + req_arr[:, 1],
-        )
-        found = pos < len(skeys)
+        pos = np.searchsorted(slinear, req_arr[:, 0] * W + req_arr[:, 1])
+        found = pos < n_px
         found[found] = (
             skeys[pos[found], 0] == req_arr[found, 0]
         ) & (skeys[pos[found], 1] == req_arr[found, 1])
@@ -200,11 +212,23 @@ def evaluate_window(
             missing = req_arr[~found].tolist()
             raise EngineError(f"缺少必读像素坐标，例如 {missing[:5]}，共 {len(missing)} 个")
 
-    idx_of = np.full((H, W), -1, dtype=np.int64)
-    if len(keys):
-        idx_of[skeys[:, 0], skeys[:, 1]] = np.arange(len(skeys))
-
     ph, pw = r1 - r0, c1 - c0
+
+    # -- 窗口局部索引图：只覆盖 9 个 tap 可能读到的源点包围盒 --------------
+    # 输出行 p∈[r0,r1) 配 u∈{-1,0,1}，源行范围恰为 [r0-1, r1]；列同理。
+    # 裁到图内后尺寸 <= (ph+2)*(pw+2)，与整图 H*W 完全无关。
+    r_lo, r_hi = max(0, r0 - 1), min(H, r1 + 1)
+    c_lo, c_hi = max(0, c0 - 1), min(W, c1 + 1)
+    local_idx = np.full((r_hi - r_lo, c_hi - c_lo), -1, dtype=np.int64)
+    if n_px:
+        inside = (
+            (skeys[:, 0] >= r_lo) & (skeys[:, 0] < r_hi)
+            & (skeys[:, 1] >= c_lo) & (skeys[:, 1] < c_hi)
+        )
+        hit_keys = skeys[inside]
+        # 写入排序后的像素行号；窗口外的合法额外像素被 inside 滤掉，不占索引图
+        local_idx[hit_keys[:, 0] - r_lo, hit_keys[:, 1] - c_lo] = np.nonzero(inside)[0]
+
     out = np.broadcast_to(bias, (ph, pw, O)).copy()
     rows = np.arange(r0, r1)[:, None]
     cols = np.arange(c0, c1)[None, :]
@@ -215,20 +239,26 @@ def evaluate_window(
         valid = (sr >= 0) & (sr < H) & (sc >= 0) & (sc < W)  # (ph,pw)
         if not np.any(valid):
             continue  # 整个 tap 只落在补零圈：无权重贡献，也无常量贡献
-        if len(svals):
-            sr_c = np.clip(sr, 0, H - 1)
-            sc_c = np.clip(sc, 0, W - 1)
-            flat_idx = idx_of[sr_c, sc_c]  # 有效位置必命中必读集合
-            gathered = svals[flat_idx]     # (ph,pw,C)
-            mask = valid[..., None]        # (ph,pw,1)
-            wgt = A[:, :, ui // 3, ui % 3]   # (O,C)
-            # 图内 tap 的原始像素贡献：Σ_c A[o,c] * X[src,c]（掩码外置零）
-            out += np.einsum("hwc,oc->hwo", gathered * mask, wgt)
+        vmask = valid.astype(np.float64)
         cst = t[:, :, ui // 3, ui % 3]   # (O,C)
-        # 图内 tap 的常量修正：仅图内源点计入 Σ_c t[o,c]
-        out += np.einsum("hw,oc->hwo", valid.astype(np.float64), cst)
+        # 图内 tap 的常量修正：仅图内源点计入 Σ_c t[o,c]。
+        # a=0（零缩放）通道的 t=K*b 同样在此计入 —— 其图内偏移不丢。
+        out += np.einsum("hw,oc->hwo", vmask, cst)
 
-    # 注：a=0 的通道在 A=K*a 中整列为零，数学上自动无贡献，无需特判
+        wgt = A[:, :, ui // 3, ui % 3]   # (O,C)
+        if n_px == 0 or not np.any(wgt):
+            # A 整 tap 为 0（零权重或 a=0 通道）：无原始像素项
+            continue
+        # 越界位置裁剪到局部图内以便取数，其结果由 vmask 精确清零；
+        # 合法位置对非零 A tap 必被上面的必读校验保证命中（idx>=0）。
+        ridx = np.clip(sr - r_lo, 0, r_hi - r_lo - 1)
+        cidx = np.clip(sc - c_lo, 0, c_hi - c_lo - 1)
+        hit = local_idx[ridx, cidx]              # (ph,pw)，广播高级索引
+        gathered = svals[np.maximum(hit, 0)]     # (ph,pw,C)，-1 借第 0 行占位
+        # 图内 tap 的原始像素贡献：Σ_c A[o,c] * X[src,c]，掩码位置零
+        out += np.einsum("hwc,oc,hw->hwo", gathered, wgt, vmask)
+
+    # 注：a=0 的通道在 A=K*a 中整列为零，数学上自动无像素贡献，无需特判
     return out
 
 

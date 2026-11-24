@@ -116,7 +116,11 @@ class EvalRequest(_PackRef):
     window: Window
     pixels: Dict[str, List[float]] = Field(
         ...,
-        description='原始像素，键 "r,c"，值为长度 C 的逐通道原始值（未标准化）',
+        description=(
+            '原始像素，键 "r,c"，值为长度 C 的逐通道原始值（未标准化）。'
+            "当 /required-coordinates 返回空清单时允许传 {}；"
+            "清单非空却缺任一必读坐标由 /evaluate 返回 422。"
+        ),
     )
 
     @field_validator("pixels")
@@ -138,8 +142,8 @@ class EvalRequest(_PackRef):
                 raise ValueError(f"像素 {key!r} 通道数必须在 1..{MAX_CHANNELS} 之间")
             if any(abs(x) > MAX_ABS for x in val):
                 raise ValueError(f"像素 {key!r} 存在绝对值超过 {MAX_ABS:g} 的值")
-        if not v:
-            raise ValueError("pixels 不能为空")
+        # 注意：空字典 {} 合法 —— 全零卷积 / 全 a=0 时必读清单为空，
+        # 常量项（含零缩放通道 b 的图内 tap 修正）仍可求值。
         return v
 
 
